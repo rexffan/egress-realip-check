@@ -9,7 +9,7 @@
 
 set -u
 
-VERSION="1.8.2"
+VERSION="1.9.0"
 IP_FLAG="-4"
 IP_LABEL="IPv4"
 TIMEOUT=8
@@ -25,6 +25,24 @@ ASCII_MODE=0
 SHOW_VERBOSE=0
 AUTO_INSTALL=1
 BG_MODE=""               # "" = auto-detect, "dark" / "light" = manual override
+
+# Optional private echo endpoint for non-Cloudflare targets.
+ECHO_SERVER=""
+ECHO_TOKEN=""
+ECHO_SNI_SPOOF=0
+ECHO_SPOOFS=()
+ECHO_USE_META=0
+
+ECHO_META_HOSTS=(
+  "www.facebook.com"
+  "m.facebook.com"
+  "www.instagram.com"
+  "www.threads.net"
+  "web.whatsapp.com"
+  "business.facebook.com"
+  "graph.facebook.com"
+  "static.xx.fbcdn.net"
+)
 
 USE_COLOR=1
 USE_UNICODE=1
@@ -221,6 +239,11 @@ Options:
       --cf HOST           Add Cloudflare trace probe: https://HOST/cdn-cgi/trace
       --file FILE         Add Cloudflare trace probes from FILE:
                           "name|url" or "name|category|url"
+      --echo-server URL   Add a private HTTPS echo endpoint, e.g. https://VPS_B:8443/probe
+      --echo-token TOKEN  Token sent as X-Token to the echo endpoint
+      --echo-spoof HOST   Probe the echo endpoint while labeling/spoofing HOST
+      --echo-meta         Add common Meta hosts as echo spoof targets
+      --echo-sni-spoof    Use curl --resolve so TLS SNI and Host become the spoofed HOST
       --show-ip           Reveal full IP addresses (default: mask last 2 segments)
       --ascii             Disable Unicode glyphs and box-drawing (ASCII-only)
       --verbose           Show the URL column in the results table
@@ -237,6 +260,7 @@ Examples:
   ./routing-ip-check.sh
   ./routing-ip-check.sh --cf example.com
   ./routing-ip-check.sh --no-targets --cf your-cf-site.com
+  ./routing-ip-check.sh --no-targets --echo-server https://VPS_B:8443/probe --echo-token TOKEN --echo-meta --echo-sni-spoof
   ./routing-ip-check.sh --show-ip
   ./routing-ip-check.sh --json --no-asn
 EOF
@@ -343,6 +367,31 @@ add_cf_probe() {
   PROBES+=("$(clean_field "$name")|$(clean_field "$cat")|$(clean_field "$url")")
 }
 
+add_echo_probe() {
+  local name="$1" cat="$2" spoof_host="${3:-}"
+  PROBES+=("$(clean_field "$name")|$(clean_field "$cat")|$(clean_field "$ECHO_SERVER")|echo|$(clean_field "$spoof_host")")
+}
+
+register_echo_probes() {
+  local host
+  if [[ -z "$ECHO_SERVER" ]]; then
+    [[ "$ECHO_USE_META" -eq 0 && "${#ECHO_SPOOFS[@]}" -eq 0 ]] || die "--echo-spoof/--echo-meta requires --echo-server"
+    return
+  fi
+  [[ "$ECHO_SERVER" =~ ^https:// ]] || die "--echo-server must be an https:// URL"
+  [[ -n "$ECHO_TOKEN" ]] || die "--echo-server requires --echo-token"
+
+  add_echo_probe "Echo endpoint" "Self Echo" ""
+  if [[ "$ECHO_USE_META" -eq 1 ]]; then
+    for host in "${ECHO_META_HOSTS[@]}"; do
+      ECHO_SPOOFS+=("$host")
+    done
+  fi
+  for host in "${ECHO_SPOOFS[@]}"; do
+    add_echo_probe "Echo: $host" "Echo Spoof" "$host"
+  done
+}
+
 add_probe_file() {
   local file="$1"
   [[ -f "$file" ]] || die "probe file not found: $file"
@@ -413,6 +462,21 @@ while [[ $# -gt 0 ]]; do
     --file)
       [[ $# -ge 2 ]] || die "--file needs a path"
       add_probe_file "$2"; shift 2 ;;
+    --echo-server)
+      [[ $# -ge 2 ]] || die "--echo-server needs a URL"
+      ECHO_SERVER="$2"; shift 2 ;;
+    --echo-token)
+      [[ $# -ge 2 ]] || die "--echo-token needs a value"
+      ECHO_TOKEN="$2"; shift 2 ;;
+    --echo-spoof)
+      [[ $# -ge 2 ]] || die "--echo-spoof needs a hostname"
+      ECHO_SPOOFS+=("$2"); shift 2 ;;
+    --echo-meta)
+      ECHO_USE_META=1; shift ;;
+    --echo-sni-spoof)
+      ECHO_SNI_SPOOF=1; shift ;;
+    --echo-no-sni-spoof)
+      ECHO_SNI_SPOOF=0; shift ;;
     --show-ip)
       MASK_IP=0; shift ;;
     --mask-ip)
@@ -439,6 +503,8 @@ done
 if [[ "$INCLUDE_TARGETS" -eq 1 ]]; then
   add_target_probes
 fi
+
+register_echo_probes
 
 if [[ "$JSON" -eq 1 ]]; then
   USE_COLOR=0
@@ -604,10 +670,116 @@ probe_cf() {
     "$ip" "${http_code:-200}" "$remote_ip" "${ttfb:-0}" >> "$TMP_ROWS"
 }
 
+resolve_echo_server_ip() {
+  local host="$1" family="$2" ip=""
+  if is_ip "$host"; then
+    printf '%s' "$host"
+    return
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    if [[ "$family" == "-6" ]]; then
+      ip=$(getent ahostsv6 "$host" 2>/dev/null | awk '{print $1; exit}')
+    else
+      ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    fi
+    [[ -z "$ip" ]] && ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
+  fi
+  if [[ -z "$ip" ]] && command -v dig >/dev/null 2>&1; then
+    if [[ "$family" == "-6" ]]; then
+      ip=$(dig +short AAAA "$host" 2>/dev/null | awk 'NF{print; exit}')
+    else
+      ip=$(dig +short A "$host" 2>/dev/null | awk 'NF{print; exit}')
+    fi
+  fi
+  if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+    ip=$(host "$host" 2>/dev/null | awk '/has address|has IPv6 address/{print $NF; exit}')
+  fi
+  printf '%s' "$ip"
+}
+
+probe_echo() {
+  local name="$1" cat="$2" url="$3" spoof_host="${4:-}"
+  local server_host server_port server_path server_ip body_file meta rc body
+  local http_code remote_ip ttfb ip reason display_host probe_url resolve_ip
+  server_host=$(strip_url_host "$ECHO_SERVER")
+  server_port=$(printf '%s' "$ECHO_SERVER" | sed -nE 's#^https?://[^/]*:([0-9]+).*#\1#p')
+  [[ -z "$server_port" ]] && server_port=443
+  server_path=$(printf '%s' "$ECHO_SERVER" | sed -nE 's#^https?://[^/]+(/.*)$#\1#p')
+  [[ -z "$server_path" ]] && server_path="/probe"
+
+  body_file=$(mktemp "$TMP_DIR/echo-body.XXXXXX")
+  local curl_args=("${curl_common[@]}" "$IP_FLAG" -k
+                   -H "X-Token: $ECHO_TOKEN"
+                   -o "$body_file"
+                   --write-out $'__RIPC_HTTP_CODE=%{http_code}\n__RIPC_REMOTE_IP=%{remote_ip}\n__RIPC_TTFB=%{time_starttransfer}\n')
+
+  probe_url="$url"
+  display_host="${spoof_host:-$server_host}"
+  if [[ -n "$spoof_host" ]]; then
+    if [[ "$ECHO_SNI_SPOOF" -eq 1 ]]; then
+      server_ip=$(resolve_echo_server_ip "$server_host" "$IP_FLAG")
+      if [[ -z "$server_ip" ]]; then
+        printf 'FAIL|%s|%s|%s|%s|||||000|echo-server-dns-failed||0\n' \
+          "$(clean_field "$name")" "$(clean_field "$cat")" "$display_host" "$url" >> "$TMP_ROWS"
+        rm -f "$body_file"
+        return
+      fi
+      resolve_ip="$server_ip"
+      [[ "$resolve_ip" == *:* ]] && resolve_ip="[$resolve_ip]"
+      curl_args+=(--resolve "$spoof_host:$server_port:$resolve_ip")
+      probe_url="https://$spoof_host:$server_port$server_path"
+    else
+      curl_args+=(-H "Host: $spoof_host" -H "X-Spoofed-Host: $spoof_host")
+    fi
+  fi
+
+  meta=$(curl "${curl_args[@]}" "$probe_url" 2>"$TMP_DIR/curl.err.$BASHPID")
+  rc=$?
+  body=$(<"$body_file")
+  rm -f "$body_file"
+
+  http_code=$(printf '%s\n' "$meta" | sed -n 's/^__RIPC_HTTP_CODE=//p' | tail -1)
+  remote_ip=$(printf '%s\n' "$meta" | sed -n 's/^__RIPC_REMOTE_IP=//p' | tail -1)
+  ttfb=$(printf '%s\n' "$meta" | sed -n 's/^__RIPC_TTFB=//p' | tail -1)
+  ttfb=$(awk -v t="${ttfb:-0}" 'BEGIN{printf "%.0f", t*1000}')
+  [[ -z "$http_code" ]] && http_code="000"
+
+  if [[ "$rc" -ne 0 ]]; then
+    reason=$(curl_error_text "$rc")
+    printf 'FAIL|%s|%s|%s|%s|||||%s|%s|%s|%s\n' \
+      "$(clean_field "$name")" "$(clean_field "$cat")" "$display_host" "$probe_url" \
+      "$http_code" "$reason" "$remote_ip" "${ttfb:-0}" >> "$TMP_ROWS"
+    return
+  fi
+
+  ip=$(printf '%s' "$body" | sed -nE 's/.*"observed_ip"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)
+  if [[ "$http_code" == "403" ]]; then
+    reason="echo-auth-rejected"
+  elif [[ ! "$http_code" =~ ^2 ]]; then
+    reason="echo-http-$http_code"
+  elif [[ -z "$ip" || ! "$(is_ip "$ip"; printf $?)" == "0" ]]; then
+    reason="echo-no-observed-ip"
+  else
+    printf 'OK|%s|%s|%s|%s|%s||||%s||%s|%s\n' \
+      "$(clean_field "$name")" "$(clean_field "$cat")" "$display_host" "$probe_url" \
+      "$ip" "$http_code" "$remote_ip" "${ttfb:-0}" >> "$TMP_ROWS"
+    return
+  fi
+
+  printf 'FAIL|%s|%s|%s|%s|||||%s|%s|%s|%s\n' \
+    "$(clean_field "$name")" "$(clean_field "$cat")" "$display_host" "$probe_url" \
+    "$http_code" "$reason" "$remote_ip" "${ttfb:-0}" >> "$TMP_ROWS"
+}
+
 probe_one() {
-  local entry="$1" name cat url
-  IFS='|' read -r name cat url <<< "$entry"
-  probe_cf "$name" "$cat" "$url"
+  local entry="$1" name cat url kind spoof_host
+  IFS='|' read -r name cat url kind spoof_host <<< "$entry"
+  if [[ "$kind" == "echo" ]]; then
+    probe_echo "$name" "$cat" "$url" "$spoof_host"
+  else
+    probe_cf "$name" "$cat" "$url"
+  fi
 }
 
 declare -A ASN_CACHE=()
@@ -748,8 +920,8 @@ print_header() {
   [[ -n "$PROXY_URL" ]] && mode="proxy"
   local worker_label="worker"
   [[ "$CONCURRENCY" -gt 1 ]] && worker_label="workers"
-  local probe_label="cf probe"
-  [[ "${#PROBES[@]}" -gt 1 ]] && probe_label="cf probes"
+  local probe_label="probe"
+  [[ "${#PROBES[@]}" -gt 1 ]] && probe_label="probes"
   local meta="${IP_LABEL}  ${G_BULLET}  ${mode}  ${G_BULLET}  ${#PROBES[@]} ${probe_label}  ${G_BULLET}  ${CONCURRENCY} ${worker_label}"
   [[ "$MASK_IP" -eq 1 ]] && meta="${meta}  ${G_BULLET}  masked"
 
@@ -826,7 +998,7 @@ print_row() {
 }
 
 print_table() {
-  section_header "Cloudflare Trace Probes"
+  section_header "Probe Results"
 
   # Build category-order map from PROBES so groups print in declared order
   # regardless of which finished first in concurrent mode.
@@ -868,9 +1040,12 @@ print_table() {
 }
 
 print_json() {
+  local kind
   while IFS='|' read -r status name cat host url ip isp asn country http_code reason remote_ip ttfb; do
-    printf '{"status":"%s","name":"%s","category":"%s","kind":"cf","host":"%s","url":"%s","ip":"%s","isp":"%s","asn":"%s","country":"%s","http_code":"%s","reason":"%s","remote_ip":"%s","ttfb_ms":"%s"}\n' \
-      "$(json_escape "$status")" "$(json_escape "$name")" "$(json_escape "$cat")" \
+    kind="cf"
+    [[ "$cat" == *Echo* ]] && kind="echo"
+    printf '{"status":"%s","name":"%s","category":"%s","kind":"%s","host":"%s","url":"%s","ip":"%s","isp":"%s","asn":"%s","country":"%s","http_code":"%s","reason":"%s","remote_ip":"%s","ttfb_ms":"%s"}\n' \
+      "$(json_escape "$status")" "$(json_escape "$name")" "$(json_escape "$cat")" "$(json_escape "$kind")" \
       "$(json_escape "$host")" "$(json_escape "$url")" "$(json_escape "$ip")" \
       "$(json_escape "$isp")" "$(json_escape "$asn")" "$(json_escape "$country")" \
       "$(json_escape "$http_code")" "$(json_escape "$reason")" "$(json_escape "$remote_ip")" \

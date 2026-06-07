@@ -2,7 +2,7 @@
 
 > **VPS 分流测试** —— 检测一台 VPS 是不是对不同站点走不同出口 IP。
 >
-> 用 Cloudflare 站点的 `/cdn-cgi/trace` 作为可信的"源 IP 镜子"，让多个 CF 站点告诉你它们各自看到的 source IP。**所有结果一致 = 单出口；出现多个 IP = 分流 / 策略 NAT / 按域名代理。**
+> 默认用 Cloudflare 站点的 `/cdn-cgi/trace` 作为可信的"源 IP 镜子"，让多个 CF 站点告诉你它们各自看到的 source IP。也可以配合你自己控制的私有 HTTPS echo endpoint，测试 Meta / Google 等不会公开回显 source IP 的目标域名。**所有结果一致 = 单出口；出现多个 IP = 分流 / 策略 NAT / 按域名代理。**
 
 ## When to use
 
@@ -32,15 +32,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/rexffan/routing-ip-check/mai
 bash <(curl -fsSL https://raw.githubusercontent.com/rexffan/routing-ip-check/main/routing-ip-check.sh) --show-ip
 ```
 
+使用私有 echo endpoint 测 Meta 系域名：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/rexffan/routing-ip-check/main/routing-ip-check.sh) \
+  --no-targets \
+  --echo-server https://YOUR_ECHO_ENDPOINT:8443/probe \
+  --echo-token YOUR_TOKEN \
+  --echo-meta \
+  --echo-sni-spoof \
+  --show-ip
+```
+
 ## Sample Output
 
 ```
-  routing-ip-check                                                        v1.8.0
+  routing-ip-check                                                        v1.9.0
   ────────────────────────────────────────────────────────────────────────────
-  IPv4  •  direct  •  44 cf probes  •  4 workers  •  masked
+  IPv4  •  direct  •  44 probes  •  4 workers  •  masked
 
 
-  ▎ Cloudflare Trace Probes
+  ▎ Probe Results
 
   ●  Cloudflare trace            175.180.•••.•••                          98ms
   ●  openai.com                  175.180.•••.•••              US · AS13335  142ms
@@ -80,6 +92,11 @@ chmod +x routing-ip-check.sh
 | `--cf HOST` | 加一个 Cloudflare trace 目标 `https://HOST/cdn-cgi/trace` |
 | `--file FILE` | 从文件批量加 CF trace 目标 |
 | `--no-targets` | 不跑内置目标列表，只跑你显式 `--cf` 加的 |
+| `--echo-server URL` | 加一个私有 HTTPS echo endpoint，例如 `https://VPS_B:8443/probe` |
+| `--echo-token TOKEN` | 访问 echo endpoint 的 token，会作为 `X-Token` 发送 |
+| `--echo-spoof HOST` | 通过 echo endpoint 测一个指定域名 |
+| `--echo-meta` | 加入常见 Meta 系域名：Facebook / Instagram / Threads / WhatsApp 等 |
+| `--echo-sni-spoof` | 用 `curl --resolve` 让 TLS SNI 和 HTTP Host 变成被测域名；测域名分流时通常需要 |
 | `--show-ip` | 显示完整 IP（默认遮蔽后两段，截图友好） |
 | `--no-proxy` | 忽略 `http_proxy` / `https_proxy` 环境变量 |
 | `--proxy URL` | 走指定代理，例如 `socks5h://127.0.0.1:1080` |
@@ -111,6 +128,35 @@ api|CDN Trace|https://api.example.com/cdn-cgi/trace
 
 `--file` 只接受 Cloudflare trace URL，路径必须是 `/cdn-cgi/trace`。
 
+## Private Echo Targets
+
+Cloudflare trace 只能测试会回显 source IP 的站点。Meta / Google / 银行 / 政府网站等目标通常不会提供这样的端点；这时可以自己部署一个 HTTPS echo endpoint，让脚本把请求"伪装成"目标域名后打到你的 endpoint，再由 endpoint 回显它观察到的真实出口 IP。
+
+测 Meta 系：
+
+```bash
+./routing-ip-check.sh \
+  --no-targets \
+  --echo-server https://YOUR_ECHO_ENDPOINT:8443/probe \
+  --echo-token YOUR_TOKEN \
+  --echo-meta \
+  --echo-sni-spoof \
+  --show-ip
+```
+
+测单个域名：
+
+```bash
+./routing-ip-check.sh \
+  --no-targets \
+  --echo-server https://YOUR_ECHO_ENDPOINT:8443/probe \
+  --echo-token YOUR_TOKEN \
+  --echo-spoof www.facebook.com \
+  --echo-sni-spoof
+```
+
+注意：本仓库只包含客户端检测逻辑，不提供公共 echo endpoint。endpoint 和 token 应该由你自己私下提供，用完后建议关闭 endpoint 或轮换 token。
+
 ## JSON
 
 ```bash
@@ -125,12 +171,15 @@ api|CDN Trace|https://api.example.com/cdn-cgi/trace
 
 ## How It Works
 
-Cloudflare 在每个站点上挂了一个 `/cdn-cgi/trace` 端点，返回里有 `ip=` 字段 —— 这是该站点观察到的客户端源 IP。脚本对一组确认会回显的 CF 站点跑这个端点，汇总它们各自看到的 IP；**全部一致 = 单出口；出现差异 = 该 VPS 有分流 / 策略 NAT / 按域名代理**。
+Cloudflare 在每个站点上挂了一个 `/cdn-cgi/trace` 端点，返回里有 `ip=` 字段 —— 这是该站点观察到的客户端源 IP。脚本对一组确认会回显的 CF 站点跑这个端点，汇总它们各自看到的 IP。
+
+对非 Cloudflare 目标，脚本可以配合私有 echo endpoint：客户端用 `--echo-spoof` / `--echo-sni-spoof` 让请求的域名特征接近真实目标，但连接落到你控制的 endpoint，由 endpoint 返回它看到的 source IP。**全部一致 = 单出口；出现差异 = 该 VPS 有分流 / 策略 NAT / 按域名代理**。
 
 ## Limitations
 
-- 只适合 Cloudflare 站点。
-- 非 Cloudflare 站点（Meta / Google 等）如果没有等价的 source-IP 回显端点，脚本不能确认它看到的源 IP。
+- 内置公开探针只适合 Cloudflare 站点。
+- 非 Cloudflare 站点（Meta / Google 等）需要你自己控制的 echo endpoint；没有 endpoint 时脚本不能确认它看到的源 IP。
+- `--echo-sni-spoof` 会让被测域名出现在 TLS SNI 中，只建议短时诊断使用。
 - 如果机房只对某个白名单域名做源地址替换，而你没有该目标的回显能力，脚本无法直接证明。
 - 如果 Cloudflare 站点关闭或拦截 `/cdn-cgi/trace`，该目标会失败。
 
